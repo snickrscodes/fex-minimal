@@ -85,7 +85,7 @@ if candidates:
 
 ## Policy update
 
-Each slot has trainable logits $z_i$ and learned probabilities $p_i=\operatorname{softmax}(z_i)$. For a slot with $K_i$ options, actions are sampled from
+Each slot has trainable logits $z_i$ and learned probabilities $p_i=\mathrm{softmax}(z_i)$. For a slot with $K_i$ options, actions are sampled from
 
 $$
 q_i(a)=(1-\epsilon)p_i(a)+\frac{\epsilon}{K_i},
@@ -93,10 +93,10 @@ $$
 
 where $\epsilon$ is the exploration fraction. The joint distribution factorizes across slots.
 
-After fitting a batch of $B$ expressions, the default reward is $R=-\operatorname{asinh}(\text{loss})$. Invalid fits receive a configurable finite penalty; a fit marked valid with nonfinite loss is an error. The elite weights are
+After fitting a batch of $B$ expressions, the default reward is $R=-\mathrm{asinh}(\text{loss})$. Invalid fits receive a configurable finite penalty; a fit marked valid with nonfinite loss is an error. The elite weights are
 
 $$
-\tau=\operatorname{quantile}_{1-\rho}(R_1,\ldots,R_B),
+\tau=\mathrm{quantile}_{1-\rho}(R_1,\ldots,R_B),
 \qquad w_b=\max(R_b-\tau,0),
 $$
 
