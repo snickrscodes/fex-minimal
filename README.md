@@ -1,0 +1,128 @@
+# Minimal FEX
+
+A compact implementation of the **Finite Expression (FEX)** approach: search over discrete mathematical expression structures, fit their continuous coefficients, and reinforce the structures that perform well.
+
+This is a **minimal variant**, not an exact reproduction of the paper's controller. It uses independent, directly trainable categorical logits with elite REINFORCE and Adam instead of a constant-input neural network. The expression grammar and loss functional are supplied by the caller.
+
+## Run
+
+Requires Python 3.10+ and PyTorch. From the project root:
+
+```bash
+python -m pip install -e .
+python -m examples.poisson
+python -m unittest discover -s tests -p 'test_policy_gradient.py' -v
+```
+
+The single example solves
+
+\[
+-u''(x)=2,\qquad x\in[-1,1],\qquad u(-1)=u(1)=0,
+\]
+
+whose exact solution is \(u(x)=1-x^2\). It runs expression search, coefficient fitting, and candidate selection, then reports the PDE/boundary loss and solution MSE on an independent grid. The single test checks the vectorized policy gradient and successive Adam updates against PyTorch autograd; it runs on CPU and also CUDA when available.
+
+## Layout
+
+```text
+fex/
+    expression.py   expression DAG, evaluation, derivatives, D/I nodes
+    leggauss.py     quadrature nodes and weights
+    evaluation.py   Regression, fit(), assess(), FitResult, optimizers
+    search.py       EliteSearch, Candidate, solve()
+
+examples/
+    poisson.py      complete PDE example
+
+tests/
+    test_policy_gradient.py
+```
+
+## Search space and objective
+
+A **builder** specifies which expression structures can be sampled:
+
+- `action_sizes`: number of choices at each discrete action slot; e.g. `(3, 2)` means three choices for one slot and two for another.
+- `build(actions) -> Expression`: translates the sampled integer choices into an expression.
+
+`EliteSearch` does not know about unary or binary operators, tree topology, or the meanings of action indices. Those belong to the builder. It samples a tensor of shape `(batch_size, num_slots)`; `ask()` turns its rows into `Expression` objects using the builder.
+
+An objective is a differentiable callable:
+
+```python
+objective(model: Model, parameters: torch.Tensor) -> torch.Tensor
+```
+
+It returns a scalar loss. `evaluation.py` includes a weighted-MSE `Regression` convenience objective, which the Poisson example uses to penalize boundary errors and assess its recovered solution. The example defines the Poisson residual objective itself. Other problems can provide their own regression, PDE, or variational objectives without changing FEX.
+
+## Fitting and search
+
+Given a builder and objective, the core workflow is:
+
+```python
+from fex import EliteSearch, fit, solve
+
+search = EliteSearch(builder, seed=0)  # builder and objective defined by caller
+
+candidates = solve(
+    search,
+    lambda expression, seed: fit(expression, objective, steps=100, seed=seed),
+    rounds=100,
+    batch_size=10,
+    pool_size=10,
+)
+
+if candidates:
+    best = candidates[0]  # lowest measured loss
+    print(best.actions, best.model.parameters, best.loss)
+```
+
+`fit(Expression, ...)` initializes its coefficients from a local seeded generator. `fit(Model, ...)` starts from the model's existing coefficients, which makes it suitable for optional warm-started refinement. It returns a `FitResult(model, loss, valid)` and retains the best finite coefficient snapshot encountered. An optimizer domain failure terminates that attempt while preserving any valid incumbent; an invalid initial point has no incumbent to preserve. Programming errors other than `DomainError` propagate.
+
+`solve()` calls `search.ask()`, fits each proposed expression, calls `search.tell()`, and retains up to `pool_size` distinct action tuples with their best measured fitted models. Repeated structures are fitted independently. Optional `refine(model, seed)` continues the retained fits. Optional `score(model) -> FitResult` replaces the fitting loss for **both** search feedback and pool ranking, including acceptance of refined results. Scoring data is therefore part of search, not a held-out test set.
+
+`solve()` returns a tuple of `Candidate(actions, model, loss)` in ascending loss order, or `()` when no candidate was valid. There is no separate result wrapper, progress callback, or checkpoint API.
+
+## Policy update
+
+Each slot has trainable logits \(z_i\) and learned probabilities \(p_i=\operatorname{softmax}(z_i)\). For a slot with \(K_i\) options, actions are sampled from
+
+\[
+q_i(a)=(1-\epsilon)p_i(a)+\frac{\epsilon}{K_i},
+\]
+
+where \(\epsilon\) is the exploration fraction. The joint distribution factorizes across slots.
+
+After fitting a batch of \(B\) expressions, the default reward is \(R=-\operatorname{asinh}(\text{loss})\). Invalid fits receive a configurable finite penalty; a fit marked valid with nonfinite loss is an error. The elite weights are
+
+\[
+\tau=\operatorname{quantile}_{1-\rho}(R_1,\ldots,R_B),
+\qquad w_b=\max(R_b-\tau,0),
+\]
+
+where \(\rho\) is `elite_fraction`. The controller uses the score-function gradient
+
+\[
+\frac1B\sum_{b=1}^{B}w_b\nabla_z\log q(a_b).
+\]
+
+It computes this gradient analytically using padded categorical tensors and `scatter_add_`, then supplies it to Adam with `maximize=True`. Padding never contributes an action or a trainable logit. The logits, sampling RNG, and update tensors can run on CPU or CUDA via `EliteSearch(..., device='cuda')`; coefficient fitting has its own `device` argument.
+
+The controller is **not autoregressive**: operator decisions are independent given its current logits. This keeps the method small and fast, but does not model conditional dependencies between operator choices. Its direct-logit controller and elite-weighting convention intentionally differ from the paper's neural-network implementation.
+
+## Numerical notes
+
+`expression.py` evaluates symbolic DAGs with PyTorch operations, including strict/protected operators, lazy `where`, derivatives, and numerical integration (`D`/`I` nodes). The `I` node uses 16-point quadrature, and differentiating it differentiates the numerical rule. `Regression` supports optional sample weights and chunking; the weighted loss normalizes weights to sum to one.
+
+Input shapes, operator definitions, numerical precision, and valid hyperparameters are largely caller contracts rather than defensive checks. For independent evaluation, use `assess(model, objective)` on data not used by search or refinement. This example and policy-gradient test are smoke checks, not a comprehensive PDE benchmark or proof of correctness.
+
+
+## Reference
+
+This project is an independent, minimal implementation of the finite expression method introduced in:
+
+Senwei Liang and Haizhao Yang. [Finite Expression Method for Solving High-Dimensional Partial Differential Equations](https://www.jmlr.org/papers/v26/23-1290.html).*Journal of Machine Learning Research*, 26(138):1–31, 2025.
+
+[Original implementation](https://github.com/LeungSamWai/Finite-expression-method)
+
+Unlike the original implementation, this project directly optimizes independent categorical logits rather than using a neural-network controller. It also uses a different reward transformation and elite-weighting convention. The implementation is not intended as an exact reproduction of the paper's experiments.
