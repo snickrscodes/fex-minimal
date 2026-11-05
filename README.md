@@ -11,16 +11,31 @@ Requires Python 3.10+ and PyTorch. From the project root:
 ```bash
 python -m pip install -e .
 python -m examples.poisson
-python -m unittest discover -s tests -p 'test_policy_gradient.py' -v
+python -m examples.poisson_high_dim
+python -m unittest discover -s tests -v
 ```
 
-The single example solves
+The examples demonstrate FEX on two Poisson problems.
+
+The one-dimensional example solves
 
 $$
 -u''(x)=2,\qquad x\in[-1,1],\qquad u(-1)=u(1)=0,
 $$
 
-whose exact solution is $u(x)=1-x^2$. It runs expression search, coefficient fitting, and candidate selection, then reports the PDE/boundary loss and solution MSE on an independent grid. The single test checks the vectorized policy gradient and successive Adam updates against PyTorch autograd; it runs on CPU and also CUDA when available.
+whose exact solution is $u(x)=1-x^2$.
+
+The 12-dimensional example solves a Poisson problem on the unit ball with exact solution
+
+$$
+u(x)=1-\|x\|_2^2+\frac14\sum_{j=1}^{12}\sin(x_j),
+$$
+
+using two vector-to-scalar leaves with automatically allocated coefficient blocks. The forcing and boundary conditions are derived from the exact solution.
+
+Both examples perform expression search, coefficient fitting, and candidate selection, then report the objective loss and solution error on independent evaluation points.
+
+Two focused tests verify the vectorized elite REINFORCE gradient and Adam updates against PyTorch autograd, and the correctness of vector-leaf evaluation, parameter allocation, and differentiation. The policy-gradient test also supports CUDA when available.
 
 ## Layout
 
@@ -182,7 +197,9 @@ Input shapes, operator definitions, numerical precision, and valid hyperparamete
 
 This project is an independent, minimal implementation of the finite expression method introduced in:
 
-Senwei Liang and Haizhao Yang. [Finite Expression Method for Solving High-Dimensional Partial Differential Equations](https://www.jmlr.org/papers/v26/23-1290.html).*Journal of Machine Learning Research*, 26(138):1–31, 2025.
+Senwei Liang and Haizhao Yang.
+[Finite Expression Method for Solving High-Dimensional Partial Differential Equations](https://www.jmlr.org/papers/v26/23-1290.html).
+*Journal of Machine Learning Research*, 26(138):1–31, 2025.
 
 [Original implementation](https://github.com/LeungSamWai/Finite-expression-method)
 
