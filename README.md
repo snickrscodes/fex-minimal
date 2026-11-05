@@ -55,6 +55,44 @@ objective(model: Model, parameters: torch.Tensor) -> torch.Tensor
 
 It returns a scalar loss. `evaluation.py` includes a weighted-MSE `Regression` convenience objective, which the Poisson example uses to penalize boundary errors and assess its recovered solution. The example defines the Poisson residual objective itself. Other problems can provide their own regression, PDE, or variational objectives without changing FEX.
 
+### Expression inputs
+
+Expressions support two kinds of input leaves:
+
+- `Node('input', value=i)` selects the scalar coordinate `x_i`.
+- `Node('vsum', value=s, transform=op)` applies a unary operator elementwise to the full input vector, then computes a learned weighted sum with a bias.
+
+For an input $x \in \mathbb{R}^D$, the vector leaf computes
+
+$$
+h(x) = \sum_{j=0}^{D-1} \alpha_j \phi(x_j) + \beta.
+$$
+
+Here, `transform=op` selects the unary function $\phi$ from `OPERATIONS`, while `transform=None` uses the identity.
+
+The `value=s` field specifies the starting coefficient index.
+The leaf consumes `D + 1` parameters:
+
+- `parameters[s:s+D]`: coordinate weights
+- `parameters[s+D]`: bias
+
+For example:
+
+```python
+expression = Expression(
+    nodes=(Node('vsum', value=0, transform='square'),),
+    outputs=(0,),
+    input_dim=50,
+    parameter_count=51,
+)
+```
+
+This represents a weighted sum of squared coordinates plus a bias, using one symbolic node.
+
+Both input types produce scalar values per sample, so they can be freely combined with existing scalar operations, derivatives, and integration nodes.
+
+Vector leaves follow the coordinatewise nonlinear reduction used in the original FEX paper, while scalar coordinate leaves provide additional flexibility.
+
 ## Fitting and search
 
 Given a builder and objective, the core workflow is:
@@ -82,6 +120,56 @@ if candidates:
 `solve()` calls `search.ask()`, fits each proposed expression, calls `search.tell()`, and retains up to `pool_size` distinct action tuples with their best measured fitted models. Repeated structures are fitted independently. Optional `refine(model, seed)` continues the retained fits. Optional `score(model) -> FitResult` replaces the fitting loss for **both** search feedback and pool ranking, including acceptance of refined results. Scoring data is therefore part of search, not a held-out test set.
 
 `solve()` returns a tuple of `Candidate(actions, model, loss)` in ascending loss order, or `()` when no candidate was valid. There is no separate result wrapper, progress callback, or checkpoint API.
+
+### Vector-to-scalar leaves
+
+Expressions support both scalar-coordinate inputs and vector-to-scalar leaves.
+
+- `Node('input', value=i)` selects coordinate `i`.
+- `Node('vsum', value=s, transform=op)` applies a unary operator to every input coordinate, then computes a learned weighted sum and bias.
+
+For $x \in \mathbb{R}^D$, a vector leaf computes:
+
+$$
+h(x) = \sum_{j=0}^{D-1} a_j \phi(x_j) + b.
+$$
+
+Here, `transform=op` specifies the unary operation, and `transform=None` uses the identity.
+
+The `value` field specifies the starting parameter offset `s`. Each vector leaf consumes `D + 1` consecutive parameters:
+
+- `parameters[s:s+D]`: coordinate weights
+- `parameters[s+D]`: bias
+
+Builders are responsible for allocating these parameter blocks and updating `Expression.parameter_count`. Multiple vector leaves can use different offsets or intentionally share parameters.
+
+Every vector leaf returns a scalar per sample, allowing it to be combined with ordinary scalar nodes and differentiated normally.
+
+The vector-to-scalar formulation follows the coordinatewise unary reduction used in the original FEX paper.
+
+### Examples
+
+Run the original one-dimensional Poisson problem:
+
+```bash
+python -m examples.poisson
+```
+
+Run a 12-dimensional Poisson problem using two vector leaves:
+
+```bash
+python -m examples.poisson_high_dim
+```
+
+The high-dimensional example searches for a solution containing a weighted sum of squared coordinates and a weighted sum of their sines. Its builder assigns parameter indices automatically.
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+`test_policy_gradient.py` checks elite REINFORCE against autograd. `test_vsum.py` checks vector-leaf evaluation, coefficient allocation, and differentiation.
 
 ## Policy update
 

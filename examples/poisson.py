@@ -15,7 +15,7 @@ class Poisson:
     forcing: torch.Tensor
 
     def __call__(self, model: Model, parameters: torch.Tensor) -> torch.Tensor:
-        _, _, hessian = derivatives(model, self.x, order=2, parameters=parameters)
+        _, _, hessian = derivatives(model, self.x, order=2, params=parameters)
         diagonal = hessian[:, 0].diagonal(dim1=-2, dim2=-1)
         laplacian = diagonal.sum(dim=1, keepdim=True)
         residual = -laplacian - self.forcing

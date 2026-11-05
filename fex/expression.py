@@ -12,20 +12,20 @@ _z, _w = leggauss_glr(QUAD_NODES)
 QUAD_POSITIONS = 0.5 * (torch.as_tensor(_z, dtype=torch.float64) + 1.0)
 QUAD_WEIGHTS = 0.5 * torch.as_tensor(_w, dtype=torch.float64)
 
-
 @dataclass(frozen=True)
 class Node:
-    # "input", "param", "literal", or an explicit operator ("D" or "I" okay too)
+    # "input", "param", "literal", "vsum", "D", "I", or an existing scalar operator
     op: str
 
-    # arguments (indices of nodes in the graph) for the op
-    # refers backward, for "D" and "I" nodes a single arg for the variable (being differentiated or integrated)
+    # arguments (indices of nodes in the graph) for the op, leaf nodes have none
     args: tuple[int, ...] = ()
 
-    # either input coordinate index (for "input"), param index (for "param")
-    # a constant (for "literal"), or (for "D" and "I") coordinate on which the op acts, for other operators leave None
+    # input / parameter index, literal value, or D/I coordinate
+    # for vsum: start index of its D + 1 (operates on all coordinates in input vector) parameter weights
     value: float | int | None = None
 
+    # for vsum only: unary name in OPERATIONS; None means identity
+    transform: str | None = None
 
 @dataclass(frozen=True)
 class Expression:
@@ -90,7 +90,7 @@ def evaluate(model: Model, inputs: Tensor, *, parameters: Tensor | None = None):
     return _evaluate(expression, expression.outputs, p, inputs)
 
 
-def _evaluate(expression, roots, p, x):
+def _evaluate(expression, roots, params, x):
     VISIT, APPLY, BRANCH, MERGE = range(4)
     # a scope is (indices into this call's x, cached node values)
     root_scope = (torch.arange(len(x), device=x.device), {})
@@ -110,14 +110,14 @@ def _evaluate(expression, roots, p, x):
                 if node.op == 'input':
                     value = x[:, node.value] if scope is root_scope else x[rows, node.value]
                 elif node.op in ('param', 'literal'):
-                    scalar = p[node.value] if node.op == 'param' else node.value
+                    scalar = params[node.value] if node.op == 'param' else node.value
                     base = x[:, 0] if scope is root_scope else x[rows, 0]
                     value = torch.ones_like(base) * scalar
                 elif node.op in ('D', 'I'):
                     if torch.is_inference_mode_enabled():
                         raise NotImplementedError('D/I nodes do not support inference_mode, use no_grad')
                     coordinates = x if scope is root_scope else x[rows]
-                    value = _function_value(expression, node, p, coordinates)
+                    value = _function_value(expression, node, params, coordinates)
                 elif node.op == 'where':
                     # evaluate the condition first and get the mask
                     # use the mask to create separate true and false row scopes
@@ -125,6 +125,12 @@ def _evaluate(expression, roots, p, x):
                     work.append((BRANCH, index, scope, None))
                     work.append((VISIT, node.args[0], scope, None))
                     continue
+                elif node.op == 'vsum': # applies to leaves
+                    coords = x if scope is root_scope else x[rows]
+                    features = coords if node.transform is None else OPERATIONS[node.transform](coords)
+                    begin = node.value
+                    end = begin + expression.input_dim
+                    value = features @ params[begin:end] + params[end]
                 else:
                     work.append((APPLY, index, scope, None))
                     for operand in node.args:
@@ -171,7 +177,7 @@ def _evaluate(expression, roots, p, x):
 
 
 # exclusively for evaluating D and I nodes
-def _function_value(expression, node, parameters, coordinates):
+def _function_value(expr, node, params, coords):
     axis = node.value
     child = node.args  # single child (tuple with 1 element)
     if node.op == 'D':
@@ -179,15 +185,15 @@ def _function_value(expression, node, parameters, coordinates):
         with torch.enable_grad():
             # don't detach anything, preserve graph for future chain rules on outer queries
             # only differentiate wrt the query, not whatever produced it
-            query = coordinates.clone().requires_grad_(True)
-            values = _evaluate(expression, child, parameters, query)[:, 0]
+            query = coords.clone().requires_grad_(True)
+            values = _evaluate(expr, child, params, query)[:, 0]
             gradient = None
             if values.requires_grad:
                 # values.sum() works because input rows are independent (only depends on its own row)
                 gradient = torch.autograd.grad(values.sum(), query, create_graph=True, allow_unused=True)[0]
 
             # evil trick: if the gradient is 0, keep it connected to the graph for future (higher-order) derivatives
-            zero = query[:, axis] * 0 + (parameters * 0).sum()
+            zero = query[:, axis] * 0 + (params * 0).sum()
             result = zero if gradient is None else gradient[:, axis] + zero
 
         # no_grad callers need the derivative's value, not its computational graph
@@ -198,15 +204,15 @@ def _function_value(expression, node, parameters, coordinates):
     # construct query tensor (to evaluate at GL nodes, only integration axis varies - other free coordinates are fixed)
     # apply weighted sum - don't special case endpoint cases (endpoint is 0) - destroys graph info
     # future derivatives are on the quad rule itself
-    s = QUAD_POSITIONS.to(coordinates)
-    w = QUAD_WEIGHTS.to(coordinates)
-    query = coordinates[:, None, :].expand(-1, QUAD_NODES, -1).clone()
-    query[:, :, axis] = coordinates[:, axis, None] * s
-    values = _evaluate(expression, child, parameters, query.reshape(-1, coordinates.shape[1]))[:, 0]
-    return coordinates[:, axis] * (values.reshape(len(coordinates), QUAD_NODES) * w).sum(dim=1)
+    s = QUAD_POSITIONS.to(coords)
+    w = QUAD_WEIGHTS.to(coords)
+    query = coords[:, None, :].expand(-1, QUAD_NODES, -1).clone()
+    query[:, :, axis] = coords[:, axis, None] * s
+    values = _evaluate(expr, child, params, query.reshape(-1, coords.shape[1]))[:, 0]
+    return coords[:, axis] * (values.reshape(len(coords), QUAD_NODES) * w).sum(dim=1)
 
 
-def derivatives(model: Model, inputs: Tensor, *, order: int = 1, parameters: Tensor | None = None):
+def derivatives(model: Model, inputs: Tensor, *, order: int = 1, params: Tensor | None = None):
     # returns value, with some derivatives
     # value: (N, O), O is number of outputs
     # jacobian: (N, O, D), partials of each output fn wrt each of its coordinates, D is number of coordinates
@@ -214,7 +220,7 @@ def derivatives(model: Model, inputs: Tensor, *, order: int = 1, parameters: Ten
 
     # leaves parameter differentiation possible (same trick as for D nodes), but only use this with gradients enabled
     x = inputs if inputs.requires_grad else inputs.detach().clone().requires_grad_(True)
-    p = parameters if parameters is not None else torch.tensor(model.parameters, dtype=inputs.dtype, device=inputs.device)
+    p = params if params is not None else torch.tensor(model.parameters, dtype=inputs.dtype, device=inputs.device)
     # zero links keep constant/unused-coordinate derivatives connected to
     # inputs and coefficients, including further derivatives of exact zeros
     anchor = (p * 0).sum()  # multiply before sum (prevent overflow)

@@ -10,11 +10,11 @@ from .expression import DomainError, Expression, Model, evaluate
 @dataclass
 class Regression:
     x: Tensor # (N, D)
-    y: Tensor # (N, 0)
+    y: Tensor # (N, O)
     weights: Tensor | None = None
     chunk_size: int | None = None
 
-    def __call__(self, model: Model, parameters: Tensor) -> Tensor:
+    def __call__(self, model: Model, params: Tensor) -> Tensor:
 
         weights = self.weights
         if weights is not None:
@@ -22,7 +22,7 @@ class Regression:
             scaled = weights.double() / weights.max()
             weights = scaled / scaled.sum()
 
-        total = (parameters * 0).sum().double() # anchor (evil trick) for autograd graph connection (in case of D nodes)
+        total = (params * 0).sum().double() # anchor (evil trick) for autograd graph connection (in case of D nodes)
 
         N, O = self.y.shape
         size = N if self.chunk_size is None else self.chunk_size
@@ -30,7 +30,7 @@ class Regression:
         for begin in range(0, N, size):
             end = begin + size
 
-            y_hat = evaluate(model, self.x[begin:end], parameters=parameters)
+            y_hat = evaluate(model, self.x[begin:end], parameters=params)
             r = y_hat.double() - self.y[begin:end].double()
             err = r * r
 
@@ -77,12 +77,12 @@ def fit(start: Expression | Model, objective: Objective, optimizer: Callable[[Te
         initial = torch.randn(start.parameter_count, generator=generator, dtype=dtype)
         start = Model(start, tuple(initial.tolist()))
 
-    parameters = torch.tensor(start.parameters, dtype=dtype, device=device, requires_grad=True)
+    params = torch.tensor(start.parameters, dtype=dtype, device=device, requires_grad=True)
     best = assess(start, objective, dtype=dtype, device=device)
-    if not best.valid or parameters.numel() == 0 or steps == 0:
+    if not best.valid or params.numel() == 0 or steps == 0:
         return best
 
-    solver = optimizer(parameters)
+    solver = optimizer(params)
 
     def remember(loss):
         nonlocal best
@@ -90,26 +90,26 @@ def fit(start: Expression | Model, objective: Objective, optimizer: Callable[[Te
         if not math.isfinite(value):
             raise DomainError('nonfinite fitting objective')
         if value < best.loss:
-            coefficients = tuple(parameters.detach().cpu().tolist())
+            coefficients = tuple(params.detach().cpu().tolist())
             best = FitResult(Model(start.expression, coefficients), value, True)
 
     def closure():
         solver.zero_grad()
-        loss = objective(start, parameters) + (parameters * 0).sum()
+        loss = objective(start, params) + (params * 0).sum()
         remember(loss)
         loss.backward()
-        if not bool(torch.isfinite(parameters.grad).all()):
+        if not bool(torch.isfinite(params.grad).all()):
             raise DomainError('nonfinite coefficient gradient')
         return loss
 
     try:
         for _ in range(steps):
             solver.step(closure)
-            if not bool(torch.isfinite(parameters).all()):
+            if not bool(torch.isfinite(params).all()):
                 raise DomainError('nonfinite optimizer iterate')
 
             # capture final iterates that the optimizer may not have evaluated
-            remember(objective(start, parameters))
+            remember(objective(start, params))
     except DomainError:
         pass
 
