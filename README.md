@@ -16,11 +16,11 @@ python -m unittest discover -s tests -p 'test_policy_gradient.py' -v
 
 The single example solves
 
-\[
+$$
 -u''(x)=2,\qquad x\in[-1,1],\qquad u(-1)=u(1)=0,
-\]
+$$
 
-whose exact solution is \(u(x)=1-x^2\). It runs expression search, coefficient fitting, and candidate selection, then reports the PDE/boundary loss and solution MSE on an independent grid. The single test checks the vectorized policy gradient and successive Adam updates against PyTorch autograd; it runs on CPU and also CUDA when available.
+whose exact solution is $u(x)=1-x^2$. It runs expression search, coefficient fitting, and candidate selection, then reports the PDE/boundary loss and solution MSE on an independent grid. The single test checks the vectorized policy gradient and successive Adam updates against PyTorch autograd; it runs on CPU and also CUDA when available.
 
 ## Layout
 
@@ -85,26 +85,26 @@ if candidates:
 
 ## Policy update
 
-Each slot has trainable logits \(z_i\) and learned probabilities \(p_i=\operatorname{softmax}(z_i)\). For a slot with \(K_i\) options, actions are sampled from
+Each slot has trainable logits $z_i$ and learned probabilities $p_i=\operatorname{softmax}(z_i)$. For a slot with $K_i$ options, actions are sampled from
 
-\[
+$$
 q_i(a)=(1-\epsilon)p_i(a)+\frac{\epsilon}{K_i},
-\]
+$$
 
-where \(\epsilon\) is the exploration fraction. The joint distribution factorizes across slots.
+where $\epsilon$ is the exploration fraction. The joint distribution factorizes across slots.
 
-After fitting a batch of \(B\) expressions, the default reward is \(R=-\operatorname{asinh}(\text{loss})\). Invalid fits receive a configurable finite penalty; a fit marked valid with nonfinite loss is an error. The elite weights are
+After fitting a batch of $B$ expressions, the default reward is $R=-\operatorname{asinh}(\text{loss})$. Invalid fits receive a configurable finite penalty; a fit marked valid with nonfinite loss is an error. The elite weights are
 
-\[
+$$
 \tau=\operatorname{quantile}_{1-\rho}(R_1,\ldots,R_B),
 \qquad w_b=\max(R_b-\tau,0),
-\]
+$$
 
-where \(\rho\) is `elite_fraction`. The controller uses the score-function gradient
+where $\rho$ is `elite_fraction`. The controller uses the score-function gradient
 
-\[
+$$
 \frac1B\sum_{b=1}^{B}w_b\nabla_z\log q(a_b).
-\]
+$$
 
 It computes this gradient analytically using padded categorical tensors and `scatter_add_`, then supplies it to Adam with `maximize=True`. Padding never contributes an action or a trainable logit. The logits, sampling RNG, and update tensors can run on CPU or CUDA via `EliteSearch(..., device='cuda')`; coefficient fitting has its own `device` argument.
 
