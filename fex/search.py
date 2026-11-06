@@ -21,15 +21,14 @@ class Candidate:
 
 
 def loss_reward(loss: Tensor) -> Tensor:
-    return -torch.asinh(loss)
-
+    return 1 / (1 + torch.sqrt(loss.clamp(max=200000)))
 
 class EliteSearch:
     def __init__(self, 
         builder, *, seed: int = 0, lr: float = 0.1,
         exploration: float = 0.1, elite_fraction: float = 0.5,
         reward: Callable[[Tensor], Tensor] = loss_reward,
-        invalid_reward: float = -1000.0,
+        invalid_reward: float = 0.0,
         device: torch.device | str = 'cpu'
     ):
 

@@ -169,7 +169,15 @@ $$
 
 where $\epsilon$ is the exploration fraction. The joint distribution factorizes across slots.
 
-After fitting a batch of $B$ expressions, the default reward is $R=-\mathrm{asinh}(\text{loss})$. Invalid fits receive a configurable finite penalty; a fit marked valid with nonfinite loss is an error. The elite weights are
+After fitting a batch of $B$ expressions, the default reward is
+
+$$
+R(L) = \frac{1}{1+\sqrt{\min(L,200000)}},
+$$
+
+following the reward transformation used in the authors' public implementation, with a loss cap of 200000. This assumes nonnegative objective losses. Invalid fits receive a reward of zero.
+
+The elite weights are
 
 $$
 \tau=\mathrm{quantile}_{1-\rho}(R_1,\ldots,R_B),
@@ -203,4 +211,4 @@ Senwei Liang and Haizhao Yang.
 
 [Original implementation](https://github.com/LeungSamWai/Finite-expression-method)
 
-Unlike the original implementation, this project directly optimizes independent categorical logits rather than using a neural-network controller. It also uses a different reward transformation and elite-weighting convention. The implementation is not intended as an exact reproduction of the paper's experiments.
+Unlike the original implementation, this project directly optimizes independent categorical logits rather than using a neural-network controller. The implementation is not intended as an exact reproduction of the paper's experiments.
