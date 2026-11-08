@@ -107,6 +107,43 @@ Both input types produce scalar values per sample, so they can be combined with 
 
 The vector-to-scalar formulation follows the coordinatewise unary reduction used in the original FEX paper, while scalar-coordinate leaves provide additional flexibility.
 
+### DAG construction
+
+`DAGBuilder` constructs `Expression` objects with automatic node indexing, coefficient allocation, and categorical operator choices. It supports arbitrary DAGs, shared subexpressions, and multiple outputs.
+
+```python
+from fex import DAGBuilder
+
+b = DAGBuilder(input_dim=3)
+
+leaf = b.vsum(("square", "sin"))
+root = b.unary(("cos", None), leaf)
+b.output(root)
+
+print(b.action_sizes)     # (2, 2)
+print(b.parameter_count)  # 6
+
+expression = b.build((0, 1))
+```
+
+A string (or `None` for identity) specifies a fixed unary operator; a sequence specifies categorical choices. Action slots follow declaration order. `build(actions)` resolves these choices into an ordinary `Expression` DAG.
+
+Vector leaves compute
+
+\[
+L(x)=\sum_{j=1}^D w_j\phi(x_j)+b.
+\]
+
+Scalar unary operations default to
+
+\[
+U(z)=\alpha\phi(z)+\beta.
+\]
+
+Set `affine_unary=False` on the builder, or `affine=False` on an individual unary operation, to omit the scale and bias. Reusing a builder handle shares the corresponding computation and parameters.
+
+The builder is optional; `Node` and `Expression` can still be constructed directly.
+
 ## Fitting and search
 
 Given a builder and objective, the core workflow is:
