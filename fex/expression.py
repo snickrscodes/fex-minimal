@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from operator import index
 
 import torch
 from torch import Tensor
@@ -36,6 +37,86 @@ class Expression:
     input_dim: int
     parameter_count: int = 0
 
+
+class DAGBuilder:
+    # construct a DAG and its parameters, handles are indices into builder _nodes
+    # unary nodes automatically get scale and bias
+
+    def __init__(self, input_dim, *, affine_unary=True):
+        self.input_dim = input_dim
+        self.affine_unary = affine_unary # set to false for unscaled ops
+        self.parameter_count = 0
+        self.outputs = ()
+        self._nodes = []
+
+    def _add(self, entry):
+        self._nodes.append(entry)
+        return len(self._nodes) - 1
+
+
+    # a string (or None) specifies a fixed operator; a sequence specifies categorical choices, build(actions) selects one
+    def _operator(self, ops, make):
+        entry = make(ops) if ops is None or isinstance(ops, str) else tuple(make(op) for op in ops)
+        return self._add(entry)
+
+    def node(self, op, *args, value=None):
+        return self._add(Node(op, args, value))
+
+    def input(self, coordinate):
+        return self.node('input', value=coordinate)
+
+    def literal(self, value):
+        return self.node('literal', value=value)
+
+    def parameter(self):
+        return self.node('param', value=self._allocate(1))
+
+    def _allocate(self, count):
+        start = self.parameter_count
+        self.parameter_count += count
+        return start
+
+    def vsum(self, operators=None):
+        start = self._allocate(self.input_dim + 1)
+        return self._operator(operators, lambda op: Node('vsum', value=start, transform=op))
+
+    def unary(self, operators, child, *, affine=None, value=None):
+        result = self._operator(operators, lambda op: child if op is None else Node(op, (child,), value),)
+        if self.affine_unary if affine is None else affine:
+            scale, bias = self.parameter(), self.parameter()
+            result = self.node('add', self.node('mul', scale, result), bias)
+        return result
+
+    def binary(self, operators, left, right):
+        return self._operator(operators, lambda op: Node(op, (left, right)))
+
+    def output(self, *handles):
+        self.outputs = handles
+        return self
+
+    @property
+    def action_sizes(self):
+        return tuple(len(n) for n in self._nodes if isinstance(n, tuple))
+
+    def build(self, actions=()):
+        # resolve categorical choices and remap builder handles to DAG indices
+        # identity aliases remove nodes, so the two indices can differ
+        assert len(actions) == len(self.action_sizes)
+        choices = iter(actions)
+        nodes, handles = [], []
+
+        for entry in self._nodes:
+            node = entry[next(choices)] if isinstance(entry, tuple) else entry
+            if isinstance(node, int): # identity aliases its child
+                handles.append(handles[node])
+            else:
+                handles.append(len(nodes))
+                nodes.append(replace(node, args=tuple(handles[a] for a in node.args)))
+
+        return Expression(
+            tuple(nodes), tuple(handles[h] for h in self.outputs),
+            self.input_dim, self.parameter_count,
+        )
 
 @dataclass(frozen=True)
 class Model:

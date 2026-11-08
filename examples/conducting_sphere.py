@@ -17,11 +17,11 @@ import time
 import torch
 
 from fex import (
+    DAGBuilder,
     DomainError,
     EliteSearch,
     Expression,
     Model,
-    Node,
     assess,
     derivatives,
     evaluate,
@@ -57,7 +57,7 @@ DERIVATIVE_KEY = (
 )
 
 
-class Builder:
+class Builder(DAGBuilder):
     """Two independent regional trees:
 
         B(P1(L1(x)), P2(L2(x)))
@@ -68,44 +68,16 @@ class Builder:
     Coordinate weights are independent.
     """
 
-    action_sizes = (
-        len(LEAF),
-        len(POST),
-        len(LEAF),
-        len(POST),
-        len(BINARY),
-    ) * 2
-
-    def build(self, actions):
-        nodes = []
+    def __init__(self):
+        # Compatibility: unscaled posts, slots (leaf, post, leaf, post, binary)
+        # per region, and four consecutive (wx, wy, wz, b) coefficient blocks.
+        super().__init__(3, affine_unary=False)
         outputs = []
-
-        for region in range(2):
-            u1, p1, u2, p2, binary = map(
-                int, actions[5 * region:5 * region + 5]
-            )
-            children = []
-
-            for side, (u, p) in enumerate(((u1, p1), (u2, p2))):
-                index = len(nodes)
-                nodes.append(
-                    Node(
-                        "vsum",
-                        value=8 * region + 4 * side,
-                        transform=LEAF[u],
-                    )
-                )
-
-                if POST[p] is not None:
-                    nodes.append(Node(POST[p], (index,)))
-                    index = len(nodes) - 1
-
-                children.append(index)
-
-            outputs.append(len(nodes))
-            nodes.append(Node(BINARY[binary], tuple(children)))
-
-        return Expression(tuple(nodes), tuple(outputs), 3, 16)
+        for _ in range(2):
+            left = self.unary(POST, self.vsum(LEAF))
+            right = self.unary(POST, self.vsum(LEAF))
+            outputs.append(self.binary(BINARY, left, right))
+        self.output(*outputs)
 
 
 def initial_model(expression, seed):
