@@ -130,15 +130,15 @@ A string (or `None` for identity) specifies a fixed unary operator; a sequence s
 
 Vector leaves compute
 
-\[
+$$
 L(x)=\sum_{j=1}^D w_j\phi(x_j)+b.
-\]
+$$
 
 Scalar unary operations default to
 
-\[
+$$
 U(z)=\alpha\phi(z)+\beta.
-\]
+$$
 
 Set `affine_unary=False` on the builder, or `affine=False` on an individual unary operation, to omit the scale and bias. Reusing a builder handle shares the corresponding computation and parameters.
 
