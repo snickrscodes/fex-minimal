@@ -10,47 +10,92 @@ Requires Python 3.10+ and PyTorch. From the project root:
 
 ```bash
 python -m pip install -e .
-python -m examples.poisson
-python -m examples.poisson_high_dim
 python -m unittest discover -s tests -v
 ```
 
-The examples demonstrate FEX on two Poisson problems.
+Run the two small Poisson examples with:
 
-The one-dimensional example solves
+```bash
+python -m examples.poisson
+python -m examples.poisson_high_dim
+```
+
+The conducting-sphere example performs a larger, ten-seed search and can be run separately:
+
+```bash
+python -m examples.conducting_sphere
+```
+
+## Examples
+
+### One-dimensional Poisson
+
+`examples/poisson.py` solves
 
 $$
 -u''(x)=2,\qquad x\in[-1,1],\qquad u(-1)=u(1)=0,
 $$
 
-whose exact solution is $u(x)=1-x^2$.
+whose exact solution is $u(x)=1-x^2$. It searches over a scalar unary operator with a fitted scale and offset, minimizing the PDE residual plus a boundary penalty. It reports the fitted objective loss and solution MSE on an independent grid.
 
-The 12-dimensional example solves a Poisson problem on the unit ball with exact solution
+### Twelve-dimensional Poisson
+
+`examples/poisson_high_dim.py` solves a Poisson problem on the unit ball with exact solution
 
 $$
 u(x)=1-\|x\|_2^2+\frac14\sum_{j=1}^{12}\sin(x_j),
 $$
 
-using two vector-to-scalar leaves with automatically allocated coefficient blocks. The forcing and boundary conditions are derived from the exact solution.
+using two vector-to-scalar leaves. Its custom builder advances the coefficient offset for each leaf (26 coefficients in total); the forcing and boundary conditions are derived from the exact solution. The example searches over square and sine leaf transformations, fits and refines their coefficients, and reports the objective loss and solution MSE on independent points.
 
-Both examples perform expression search, coefficient fitting, and candidate selection, then report the objective loss and solution error on independent evaluation points.
+### Conducting-sphere interface
 
-Two focused tests verify the vectorized elite REINFORCE gradient and Adam updates against PyTorch autograd, and the correctness of vector-leaf evaluation, parameter allocation, and differentiation. The policy-gradient test also supports CUDA when available.
+`examples/conducting_sphere.py` searches for separate interior and exterior potentials using only Cartesian inputs $(x,y,z)$. The known interface is the unit sphere, with an outer boundary at radius 2. The equations are
+
+$$
+\Delta u_{\mathrm{in}}=0\quad (\|x\|_2<1),\qquad
+\Delta u_{\mathrm{out}}=0\quad (1<\|x\|_2<2),
+$$
+
+with continuity, a normal-derivative jump, and a prescribed outer value:
+
+$$
+u_{\mathrm{in}}=u_{\mathrm{out}},\qquad
+n\cdot(\nabla u_{\mathrm{in}}-\nabla u_{\mathrm{out}})=1
+\quad (\|x\|_2=1),\qquad
+u_{\mathrm{out}}=\frac12\quad (\|x\|_2=2).
+$$
+
+The exact potentials, used only for independent error assessment, are
+
+$$
+u_{\mathrm{in}}(x)=1,\qquad u_{\mathrm{out}}(x)=\frac1{\|x\|_2}.
+$$
+
+Each regional expression combines two vector leaves, optional unscaled unary post-operators, and a binary operator. `DAGBuilder` provides ten categorical action slots and 16 trainable coefficients across both outputs. Neither radius nor squared radius is supplied as an input feature. The example registers a strict scalar `sqrt` operation; invalid expression domains are rejected rather than clipped.
+
+Each seed uses domain-aware coefficient initialization, Adam followed by L-BFGS, pool refinement, and search-time scoring on separate validation points. It reports validation loss and volume-weighted relative $L^2$ error on independent samples, as well as runtime, the selected exterior structure, and summary statistics across ten seeds. **Validation loss is used for search feedback and ranking**, so the independent relative-error points are the held-out check.
 
 ## Layout
 
 ```text
 fex/
-    expression.py   expression DAG, evaluation, derivatives, D/I nodes
-    leggauss.py     quadrature nodes and weights
-    evaluation.py   Regression, fit(), assess(), FitResult, optimizers
-    search.py       EliteSearch, Candidate, solve()
+    __init__.py         public API
+    expression.py       expression DAG, DAGBuilder, evaluation, derivatives, D/I nodes
+    leggauss.py         quadrature nodes and weights
+    evaluation.py       Regression, fit(), assess(), FitResult, optimizers
+    search.py           EliteSearch, Candidate, solve()
 
 examples/
-    poisson.py      complete PDE example
+    poisson.py             1-D Poisson problem
+    poisson_high_dim.py    12-D Poisson problem
+    conducting_sphere.py   3-D conducting-sphere interface problem
 
 tests/
-    test_policy_gradient.py
+    test_builder.py            DAG construction and scalar operators
+    test_policy_gradient.py    elite REINFORCE gradient and Adam updates
+    test_sphere_builder.py     sphere grammar and physics-loss compatibility
+    test_vsum.py               vector leaves and differentiation
 ```
 
 ## Search space and objective
@@ -68,7 +113,7 @@ An objective is a differentiable callable:
 objective(model: Model, parameters: torch.Tensor) -> torch.Tensor
 ```
 
-It returns a scalar loss. `evaluation.py` includes a weighted-MSE `Regression` convenience objective, which the Poisson example uses to penalize boundary errors and assess its recovered solution. The example defines the Poisson residual objective itself. Other problems can provide their own regression, PDE, or variational objectives without changing FEX.
+It returns a scalar loss. `evaluation.py` includes a weighted-MSE `Regression` convenience objective, which both Poisson examples use for boundary penalties and independent solution-error assessment. The PDE residual objectives are defined in the examples themselves. Other problems can provide their own regression, PDE, or variational objectives without changing FEX.
 
 ### Expression inputs
 
@@ -101,7 +146,7 @@ expression = Expression(
 )
 ```
 
-Builders allocate these parameter blocks automatically, advancing the offset for each new leaf and setting `Expression.parameter_count`. Different leaves can also intentionally share coefficients.
+`DAGBuilder.vsum()` allocates these parameter blocks automatically, advancing the offset for each new leaf and setting `Expression.parameter_count`. Custom builders can track the offsets explicitly, as in the 12-D Poisson example. Expressions constructed directly can also intentionally share coefficients between leaves.
 
 Both input types produce scalar values per sample, so they can be combined with the existing scalar operations, derivatives, and integration nodes.
 
@@ -172,29 +217,13 @@ if candidates:
 
 `solve()` returns a tuple of `Candidate(actions, model, loss)` in ascending loss order, or `()` when no candidate was valid. There is no separate result wrapper, progress callback, or checkpoint API.
 
-### Examples
-
-Run the original one-dimensional Poisson problem:
-
-```bash
-python -m examples.poisson
-```
-
-Run a 12-dimensional Poisson problem using two vector leaves:
-
-```bash
-python -m examples.poisson_high_dim
-```
-
-The high-dimensional example searches for a solution containing a weighted sum of squared coordinates and a weighted sum of their sines. Its builder assigns parameter indices automatically.
-
-### Tests
+## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-`test_policy_gradient.py` checks elite REINFORCE against autograd. `test_vsum.py` checks vector-leaf evaluation, coefficient allocation, and differentiation.
+The tests cover DAG construction, affine and unscaled scalar operations, lazy branching, derivatives and integration (`test_builder.py`); elite REINFORCE gradients and Adam updates against PyTorch autograd (`test_policy_gradient.py`); equivalence of the conducting-sphere grammar to its original hand-built DAG and its physics-loss gradients (`test_sphere_builder.py`); and vector-leaf evaluation, coefficient allocation, and differentiation (`test_vsum.py`). The policy-gradient test also supports CUDA when available.
 
 ## Policy update
 
@@ -235,7 +264,7 @@ The controller is **not autoregressive**: operator decisions are independent giv
 
 `expression.py` evaluates symbolic DAGs with PyTorch operations, including strict/protected operators, lazy `where`, derivatives, and numerical integration (`D`/`I` nodes). The `I` node uses 16-point quadrature, and differentiating it differentiates the numerical rule. `Regression` supports optional sample weights and chunking; the weighted loss normalizes weights to sum to one.
 
-Input shapes, operator definitions, numerical precision, and valid hyperparameters are largely caller contracts rather than defensive checks. For independent evaluation, use `assess(model, objective)` on data not used by search or refinement. This example and policy-gradient test are smoke checks, not a comprehensive PDE benchmark or proof of correctness.
+Input shapes, operator definitions, numerical precision, and valid hyperparameters are largely caller contracts rather than defensive checks. For independent evaluation, use `assess(model, objective)` on data not used by search, scoring, or refinement. The bundled examples and focused tests are demonstrations and smoke checks, not a comprehensive PDE benchmark or proof of correctness.
 
 
 ## Reference
