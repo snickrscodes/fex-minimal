@@ -57,6 +57,29 @@ class FitResult:
     valid: bool
 
 
+@dataclass(frozen=True)
+class FitStage:
+    # one phase, each phase constructs a fresh optimizer
+    optimizer: Callable[[Tensor], torch.optim.Optimizer]
+    steps: int
+
+def fit_stages(
+    start: Expression | Model, objective: Objective,
+    stages: tuple[FitStage, ...] | list[FitStage], *,
+    seed: int = 0, dtype=torch.float64, device='cpu'
+) -> FitResult:
+
+    # warm-start successive optimizers and return the last valid incumbent
+    current = start
+    incumbent = None
+    for stage in stages:
+        result = fit(current, objective, optimizer=stage.optimizer, steps=stage.steps, seed=seed, dtype=dtype, device=device)
+        if not result.valid:
+            return incumbent if incumbent is not None else result
+        incumbent = result
+        current = result.model
+    return incumbent
+
 def assess(model: Model, objective: Objective, *, dtype=torch.float64, device='cpu') -> FitResult:
     parameters = torch.tensor(model.parameters, dtype=dtype, device=device, requires_grad=True)
     try:

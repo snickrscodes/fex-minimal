@@ -1,7 +1,10 @@
 """Known-interface conducting shell with Cartesian-input FEX.
 
-Run:
-    python -m examples.conducting_sphere_cartesian
+Run one seed:
+    python -m examples.conducting_sphere
+
+For ten-seed statistics run:
+    python -m benchmarks.conducting_sphere_multiseed
 
 Requires the existing fex package.
 No radius or squared-radius feature is supplied to either expression.
@@ -9,9 +12,9 @@ No radius or squared-radius feature is supplied to either expression.
 
 from __future__ import annotations
 
-import inspect
-import math
+import argparse
 import statistics
+import math
 import time
 
 import torch
@@ -20,15 +23,17 @@ from fex import (
     DAGBuilder,
     DomainError,
     EliteSearch,
-    Expression,
+    FitStage,
     Model,
     assess,
     derivatives,
     evaluate,
     fit,
+    fit_stages,
+    format_model,
+    save_model,
     solve,
 )
-from fex.expression import OPERATIONS
 
 
 DTYPE = torch.float64
@@ -43,18 +48,6 @@ BATCH = 8
 POOL = 24
 COARSE_STEPS = 8
 REFINE_STEPS = 20
-SEEDS = range(10)
-
-# A scalar square root, not a norm primitive.
-# Negative arguments remain invalid; no abs or clipping.
-OPERATIONS.setdefault("sqrt", torch.sqrt)
-
-# Accommodates the derivative keyword in the supplied API versions.
-DERIVATIVE_KEY = (
-    "params"
-    if "params" in inspect.signature(derivatives).parameters
-    else "parameters"
-)
 
 
 class Builder(DAGBuilder):
@@ -143,42 +136,19 @@ def dataset(n, seed):
     )
 
 
-def regional_model(model, region):
-    expression = model.expression
-
-    return Model(
-        Expression(
-            expression.nodes,
-            (expression.outputs[region],),
-            3,
-            expression.parameter_count,
-        ),
-        model.parameters,
-    )
-
-
-def jet(model, coordinates, parameters):
-    return derivatives(
-        model,
-        coordinates,
-        order=2,
-        **{DERIVATIVE_KEY: parameters},
-    )
-
-
 def blocks(model, parameters, data):
     inside, outside, interface, boundary = data
     ni, no, ng = len(inside), len(outside), len(interface)
 
-    vi, gi, hi = jet(
-        regional_model(model, 0),
+    vi, gi, hi = derivatives(
+        model.select_outputs((0,)),
         torch.cat((inside, interface)),
-        parameters,
+        order=2, parameters=parameters,
     )
-    vo, go, ho = jet(
-        regional_model(model, 1),
+    vo, go, ho = derivatives(
+        model.select_outputs((1,)),
         torch.cat((outside, interface, boundary)),
-        parameters,
+        order=2, parameters=parameters,
     )
 
     # Cartesian Laplacian: V_xx + V_yy + V_zz.
@@ -238,58 +208,14 @@ def optimizer(parameters):
     )
 
 
-def readable(actions, parameters):
-    expressions = []
-
-    for region in range(2):
-        a = list(map(int, actions[5 * region:5 * region + 5]))
-        parts = []
-
-        for side, (u, post) in enumerate(
-            ((a[0], a[1]), (a[2], a[3]))
-        ):
-            offset = 8 * region + 4 * side
-            coefficients = parameters[offset:offset + 4]
-            terms = []
-
-            for weight, coordinate in zip(
-                coefficients[:3], ("x", "y", "z")
-            ):
-                feature = (
-                    coordinate
-                    if LEAF[u] is None
-                    else f"{LEAF[u]}({coordinate})"
-                )
-                terms.append(f"({weight:.10g})*{feature}")
-
-            terms.append(f"({coefficients[3]:.10g})")
-            part = "(" + " + ".join(terms) + ")"
-
-            if POST[post] is not None:
-                part = f"{POST[post]}{part}"
-
-            parts.append(part)
-
-        symbol = {
-            "add": "+",
-            "sub": "-",
-            "mul": "*",
-            "div": "/",
-        }[BINARY[a[4]]]
-
-        expressions.append(f"{parts[0]} {symbol} {parts[1]}")
-
-    return expressions
-
-
 def relative_l2(model):
     """Independent, volume-weighted error; exact solution used only here."""
     xi = sample(4096, 8000, "inside")
     xo = sample(4096, 8001, "outside")
 
     with torch.no_grad():
-        vi = evaluate(regional_model(model, 0), xi)[:, 0]
-        vo = evaluate(regional_model(model, 1), xo)[:, 0]
+        vi = evaluate(model.select_outputs((0,)), xi)[:, 0]
+        vo = evaluate(model.select_outputs((1,)), xo)[:, 0]
         target = 1 / xo.norm(dim=1)
 
         error = (vi - 1).square().mean() + 7 * (vo - target).square().mean()
@@ -298,49 +224,28 @@ def relative_l2(model):
         return float((error / energy).sqrt())
 
 
-def exterior_structure(actions):
-    u1, p1, u2, p2, binary = map(int, actions[5:])
-
-    def feature(u, p):
-        name = LEAF[u] or "id"
-        return name if POST[p] is None else f"{POST[p]}({name})"
-
-    return f"{BINARY[binary]}({feature(u1, p1)}, {feature(u2, p2)})"
-
-def main(seed):
+def main(seed=0, *, rounds=ROUNDS, batch_size=BATCH, pool_size=POOL,
+         save_to=None):
+    """Search one seed; keep the physics and sampling local to this example."""
     train = objective(dataset(N, 1000))
     validation = objective(dataset(2 * N, 2000))
     start = time.perf_counter()
 
+    # FEX executes the optimizer chain; this problem supplies its settings.
+    stages = (
+        FitStage(lambda p: torch.optim.Adam([p], lr=0.001), steps=20),
+        FitStage(optimizer, steps=COARSE_STEPS),
+    )
+
     def coarse_fit(expression, fit_seed):
-        # Preserve the domain-aware coefficient initialization.
-        start = initial_model(expression, fit_seed)
-
-        # Stage 1: Adam on continuous expression coefficients.
-        first = fit(
-            start,
-            train,
-            optimizer=lambda p: torch.optim.Adam([p], lr=0.001),
-            steps=20,
-        )
-        if not first.valid:
-            return first
-
-        # Stage 2: L-BFGS, warm-started from the Adam result.
-        second = fit(
-            first.model,
-            train,
-            optimizer=optimizer,
-            steps=COARSE_STEPS,
-        )
-        return second if second.valid else first
+        return fit_stages(initial_model(expression, fit_seed), train, stages)
 
     candidates = solve(
         EliteSearch(Builder(), seed=seed, lr=0.12),
         coarse_fit,
-        rounds=ROUNDS,
-        batch_size=BATCH,
-        pool_size=POOL,
+        rounds=rounds,
+        batch_size=batch_size,
+        pool_size=pool_size,
         seed=seed + 100,
         refine=lambda model, _: fit(
             model, train, optimizer=optimizer, steps=REFINE_STEPS,
@@ -355,6 +260,8 @@ def main(seed):
         return float("inf")
 
     best = candidates[0]
+    if save_to is not None:
+        save_model(best.model, save_to)
 
     try:
         error = relative_l2(best.model)
@@ -365,17 +272,53 @@ def main(seed):
 
     print(
         f"{seed:4d}  {error:12.4e}  {best.loss:12.4e}  "
-        f"{elapsed:7.1f}s  {exterior_structure(best.actions)}"
+        f"{elapsed:7.1f}s  "
+        f"{format_model(best.model.select_outputs((1,)), variables=('x', 'y', 'z'))[0]}"
     )
     return error
 
+def run(seeds, *, rounds=ROUNDS, batch_size=BATCH, pool_size=POOL,
+        save_to=None):
+    errors = [
+        main(
+            seed,
+            rounds=rounds,
+            batch_size=batch_size,
+            pool_size=pool_size,
+            save_to=save_to,
+        )
+        for seed in seeds
+    ]
+
+    if len(errors) > 1:
+        print(f"\nSuccesses (<1e-5): {sum(e < 1e-5 for e in errors)}/{len(errors)}")
+        print(f"Median relative L2: {statistics.median(errors):.4e}")
+        print(f"Failed seeds: {[s for s, e in zip(seeds, errors) if e >= 1e-5]}")
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num-seeds", type=int, default=1)
+    parser.add_argument("--rounds", type=int, default=ROUNDS)
+    parser.add_argument("--batch-size", type=int, default=BATCH)
+    parser.add_argument("--pool-size", type=int, default=POOL)
+    parser.add_argument("--save", help="Save the best FEX model as JSON")
+    args = parser.parse_args()
+
+    if args.num_seeds < 1:
+        parser.error("--num-seeds must be positive")
+    if args.save and args.num_seeds != 1:
+        parser.error("--save is only supported for a single seed")
+
     torch.set_num_threads(1)
 
-    print(f"{'Seed':>4}  {'Relative L2':>12}  {'Validation':>12}  {'Time':>8}  Exterior structure")
-    errors = [main(seed) for seed in SEEDS]
+    print(f"{'Seed':>4}  {'Relative L2':>12}  {'Validation':>12}  {'Time':>8}  Exterior expression")
 
-    print(f"\nSuccesses (<1e-5): {sum(e < 1e-5 for e in errors)}/{len(errors)}")
-    print(f"Median relative L2: {statistics.median(errors):.4e}")
-    print(f"Failed seeds: {[s for s, e in zip(SEEDS, errors) if e >= 1e-5]}")
+    run(
+        range(args.seed, args.seed + args.num_seeds),
+        rounds=args.rounds,
+        batch_size=args.batch_size,
+        pool_size=args.pool_size,
+        save_to=args.save,
+    )

@@ -1,11 +1,8 @@
 from dataclasses import dataclass, replace
-from operator import index
-
 import torch
 from torch import Tensor
 
 from .leggauss import leggauss_glr
-
 
 QUAD_NODES = 16
 _z, _w = leggauss_glr(QUAD_NODES)
@@ -124,10 +121,12 @@ class Model:
     expression: Expression
     parameters: tuple[float, ...]
 
+    def select_outputs(self, indices: tuple[int, ...]) -> "Model":
+        selected = tuple(self.expression.outputs[i] for i in indices)
+        return replace(self, expression=replace(self.expression, outputs=selected))
 
 class DomainError(ValueError):
     """a mathematically legal candidate is undefined or nonfinite on some rows"""
-
 
 def _protected_divide(numerator, denominator):
     # clamps 0 < denominator < 1e-6 to 1e-6, and -1e-6 < denominator < 0 to -1e-6
@@ -137,7 +136,6 @@ def _protected_divide(numerator, denominator):
         denominator, torch.where(denominator < 0, -floor, floor),
     )
     return numerator / safe
-
 
 # every function in OPERATIONS must be pointwise, must not modify its operands, and must support torch autodiff
 # the caller configures ops before eval and does not modify the table during an eval
@@ -149,16 +147,18 @@ OPERATIONS = {
     'add': torch.add,
     'sub': torch.sub,
     'mul': torch.mul,
+    "pow": torch.pow,
     'div': torch.div,
     'pdiv': _protected_divide,
     'neg': torch.neg,
     'square': torch.square,
+    'sqrt': torch.sqrt,
     'sin': torch.sin,
     'cos': torch.cos,
     'exp': torch.exp,
     'tanh': torch.tanh,
     'log': torch.log,
-    'plog': lambda a: torch.log(torch.maximum(a, torch.ones_like(a) * 1e-6)),
+    'plog': lambda a: torch.log(torch.clamp_min(a, 1e-6)),
     'ge': torch.ge,
 }
 
@@ -293,7 +293,7 @@ def _function_value(expr, node, params, coords):
     return coords[:, axis] * (values.reshape(len(coords), QUAD_NODES) * w).sum(dim=1)
 
 
-def derivatives(model: Model, inputs: Tensor, *, order: int = 1, params: Tensor | None = None):
+def derivatives(model: Model, inputs: Tensor, *, order: int = 1, parameters: Tensor | None = None):
     # returns value, with some derivatives
     # value: (N, O), O is number of outputs
     # jacobian: (N, O, D), partials of each output fn wrt each of its coordinates, D is number of coordinates
@@ -301,7 +301,7 @@ def derivatives(model: Model, inputs: Tensor, *, order: int = 1, params: Tensor 
 
     # leaves parameter differentiation possible (same trick as for D nodes), but only use this with gradients enabled
     x = inputs if inputs.requires_grad else inputs.detach().clone().requires_grad_(True)
-    p = params if params is not None else torch.tensor(model.parameters, dtype=inputs.dtype, device=inputs.device)
+    p = parameters if parameters is not None else torch.tensor(model.parameters, dtype=inputs.dtype, device=inputs.device)
     # zero links keep constant/unused-coordinate derivatives connected to
     # inputs and coefficients, including further derivatives of exact zeros
     anchor = (p * 0).sum()  # multiply before sum (prevent overflow)

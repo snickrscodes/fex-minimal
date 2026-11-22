@@ -13,40 +13,27 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-Run the two small Poisson examples with:
-
-```bash
-python -m examples.poisson
-python -m examples.poisson_high_dim
-```
-
-The conducting-sphere example performs a larger, ten-seed search and can be run separately:
+Run the conducting-sphere example with a single seed:
 
 ```bash
 python -m examples.conducting_sphere
 ```
 
+For a quick smoke test, reduce the search budget:
+
+```bash
+python -m examples.conducting_sphere --rounds 2 --batch-size 4 --pool-size 4
+```
+
+To reproduce the original ten-seed experiment:
+
+```bash
+python -m examples.conducting_sphere --num-seeds 10
+```
+
+The `--seed` argument specifies the starting seed (default 0). The default number of seeds is 1. A single-seed model can be saved using `--save model.json`.
+
 ## Examples
-
-### One-dimensional Poisson
-
-`examples/poisson.py` solves
-
-$$
--u''(x)=2,\qquad x\in[-1,1],\qquad u(-1)=u(1)=0,
-$$
-
-whose exact solution is $u(x)=1-x^2$. It searches over a scalar unary operator with a fitted scale and offset, minimizing the PDE residual plus a boundary penalty. It reports the fitted objective loss and solution MSE on an independent grid.
-
-### Twelve-dimensional Poisson
-
-`examples/poisson_high_dim.py` solves a Poisson problem on the unit ball with exact solution
-
-$$
-u(x)=1-\|x\|_2^2+\frac14\sum_{j=1}^{12}\sin(x_j),
-$$
-
-using two vector-to-scalar leaves. Its custom builder advances the coefficient offset for each leaf (26 coefficients in total); the forcing and boundary conditions are derived from the exact solution. The example searches over square and sine leaf transformations, fits and refines their coefficients, and reports the objective loss and solution MSE on independent points.
 
 ### Conducting-sphere interface
 
@@ -72,9 +59,13 @@ $$
 u_{\mathrm{in}}(x)=1,\qquad u_{\mathrm{out}}(x)=\frac1{\|x\|_2}.
 $$
 
-Each regional expression combines two vector leaves, optional unscaled unary post-operators, and a binary operator. `DAGBuilder` provides ten categorical action slots and 16 trainable coefficients across both outputs. Neither radius nor squared radius is supplied as an input feature. The example registers a strict scalar `sqrt` operation; invalid expression domains are rejected rather than clipped.
+Each regional expression combines two vector leaves, optional unscaled unary post-operators, and a binary operator. `DAGBuilder` provides ten categorical action slots and 16 trainable coefficients across both outputs. Neither radius nor squared radius is supplied as an input feature. The strict scalar `sqrt` operator is built into FEX; invalid expression domains are rejected rather than clipped.
 
-Each seed uses domain-aware coefficient initialization, Adam followed by L-BFGS, pool refinement, and search-time scoring on separate validation points. It reports validation loss and volume-weighted relative $L^2$ error on independent samples, as well as runtime, the selected exterior structure, and summary statistics across ten seeds. **Validation loss is used for search feedback and ranking**, so the independent relative-error points are the held-out check.
+Each seed uses domain-aware coefficient initialization, a reusable `fit_stages()` schedule (Adam followed by L-BFGS), pool refinement, and search-time scoring on separate validation points.
+
+The example reports validation loss, volume-weighted relative \(L^2\) error on independent samples, runtime, and the fitted exterior expression. A single-seed run can save its fitted model as JSON. The optional ten-seed run additionally reports success counts, median relative error, and failed seeds.
+
+**Validation loss is used for search feedback and ranking**, so the independent relative-error points are the held-out check.
 
 ## Layout
 
@@ -83,19 +74,23 @@ fex/
     __init__.py         public API
     expression.py       expression DAG, DAGBuilder, evaluation, derivatives, D/I nodes
     leggauss.py         quadrature nodes and weights
-    evaluation.py       Regression, fit(), assess(), FitResult, optimizers
+    evaluation.py       Regression, fit(), fit_stages(), assess(), optimizers
     search.py           EliteSearch, Candidate, solve()
+    formatting.py       format_model() for readable mathematical expressions
+    serialization.py    save_model(), load_model() JSON format
 
 examples/
-    poisson.py             1-D Poisson problem
-    poisson_high_dim.py    12-D Poisson problem
-    conducting_sphere.py   3-D conducting-sphere interface problem
+    conducting_sphere.py   3-D conducting-sphere interface problem (supports single or multi-seed)
+
+benchmarks/
+    conducting_sphere_multiseed.py   ten-seed interface experiment
 
 tests/
     test_builder.py            DAG construction and scalar operators
     test_policy_gradient.py    elite REINFORCE gradient and Adam updates
     test_sphere_builder.py     sphere grammar and physics-loss compatibility
     test_vsum.py               vector leaves and differentiation
+    test_public_api.py         selection, sqrt, staged fitting, formatting, JSON
 ```
 
 ## Search space and objective
@@ -113,7 +108,7 @@ An objective is a differentiable callable:
 objective(model: Model, parameters: torch.Tensor) -> torch.Tensor
 ```
 
-It returns a scalar loss. `evaluation.py` includes a weighted-MSE `Regression` convenience objective, which both Poisson examples use for boundary penalties and independent solution-error assessment. The PDE residual objectives are defined in the examples themselves. Other problems can provide their own regression, PDE, or variational objectives without changing FEX.
+It returns a scalar loss. `evaluation.py` includes a weighted-MSE `Regression` convenience objective. The PDE residual objectives are defined in the examples themselves. Other problems can provide their own regression, PDE, or variational objectives without changing FEX.
 
 ### Expression inputs
 
@@ -146,7 +141,7 @@ expression = Expression(
 )
 ```
 
-`DAGBuilder.vsum()` allocates these parameter blocks automatically, advancing the offset for each new leaf and setting `Expression.parameter_count`. Custom builders can track the offsets explicitly, as in the 12-D Poisson example. Expressions constructed directly can also intentionally share coefficients between leaves.
+`DAGBuilder.vsum()` allocates these parameter blocks automatically, advancing the offset for each new leaf and setting `Expression.parameter_count`. Custom builders can also track offsets explicitly if necessary. Expressions constructed directly can also intentionally share coefficients between leaves.
 
 Both input types produce scalar values per sample, so they can be combined with the existing scalar operations, derivatives, and integration nodes.
 
@@ -217,13 +212,40 @@ if candidates:
 
 `solve()` returns a tuple of `Candidate(actions, model, loss)` in ascending loss order, or `()` when no candidate was valid. There is no separate result wrapper, progress callback, or checkpoint API.
 
+## Reusable fitting, outputs, and model artifacts
+
+A numerical fitting schedule belongs to FEX, but the solver choice, number of steps, initial parameters, and objective remain caller-specified. `FitStage` and `fit_stages()` run one fresh optimizer per stage, warm-started from the previous stage's best valid model. If a later stage fails, the last valid incumbent is preserved. An initially invalid model remains invalid.
+
+```python
+from fex import FitStage, fit_stages, format_model, save_model, load_model
+import torch
+
+# start is an Expression or an initialized Model; objective is caller-defined.
+stages = (
+    FitStage(lambda p: torch.optim.Adam([p], lr=0.001), steps=20),
+    FitStage(lambda p: torch.optim.LBFGS(
+        [p], max_iter=10, max_eval=15, line_search_fn='strong_wolfe'
+    ), steps=8),
+)
+result = fit_stages(start, objective, stages, seed=0)
+if result.valid:
+    # An output view shares the original DAG and coefficients, but evaluates
+    # only the selected output(s), useful for piecewise regional solutions.
+    regional_model = result.model.select_outputs((0,))
+    print(format_model(regional_model, variables=('x', 'y', 'z'))[0])
+    save_model(result.model, 'model.json')
+    restored_model = load_model('model.json')
+```
+
+`format_model()` always returns a tuple of human-readable expressions; these strings are *not* executable code. `save_model()`/`load_model()` preserve a versioned JSON representation of the DAG and fitted coefficient vector. Custom operator names are serialized but their Python implementations are not; register such operators before evaluating a restored model. They should not be used as a substitute for the caller's PDE, sampling, or objective code.
+
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The tests cover DAG construction, affine and unscaled scalar operations, lazy branching, derivatives and integration (`test_builder.py`); elite REINFORCE gradients and Adam updates against PyTorch autograd (`test_policy_gradient.py`); equivalence of the conducting-sphere grammar to its original hand-built DAG and its physics-loss gradients (`test_sphere_builder.py`); and vector-leaf evaluation, coefficient allocation, and differentiation (`test_vsum.py`). The policy-gradient test also supports CUDA when available.
+The tests cover DAG construction, affine and unscaled scalar operations, lazy branching, derivatives and integration (`test_builder.py`); elite REINFORCE gradients and Adam updates against PyTorch autograd (`test_policy_gradient.py`); equivalence of the conducting-sphere grammar to its original hand-built DAG and its physics-loss gradients (`test_sphere_builder.py`); vector-leaf evaluation, coefficient allocation, and differentiation (`test_vsum.py`); and public API behavior (`test_public_api.py`). The policy-gradient test also supports CUDA when available.
 
 ## Policy update
 
@@ -264,7 +286,7 @@ The controller is **not autoregressive**: operator decisions are independent giv
 
 `expression.py` evaluates symbolic DAGs with PyTorch operations, including strict/protected operators, lazy `where`, derivatives, and numerical integration (`D`/`I` nodes). The `I` node uses 16-point quadrature, and differentiating it differentiates the numerical rule. `Regression` supports optional sample weights and chunking; the weighted loss normalizes weights to sum to one.
 
-Input shapes, operator definitions, numerical precision, and valid hyperparameters are largely caller contracts rather than defensive checks. For independent evaluation, use `assess(model, objective)` on data not used by search, scoring, or refinement. The bundled examples and focused tests are demonstrations and smoke checks, not a comprehensive PDE benchmark or proof of correctness.
+Input shapes, operator definitions, numerical precision, and valid hyperparameters are largely caller contracts rather than defensive checks. For independent evaluation, use `assess(model, objective)` on data not used by search, scoring, or refinement. The bundled example and focused tests are demonstrations and smoke checks, not a comprehensive PDE benchmark or proof of correctness.
 
 
 ## Reference
